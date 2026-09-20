@@ -116,6 +116,8 @@ pub trait Engine: Send + Sync {
     /// "plan" | "bypass"). These are one-shot headless launches that cannot
     /// ask mid-turn, so most engines support only a subset; the UI greys out
     /// the rest rather than promising a mode the CLI would silently ignore.
+    /// A version-gated engine (opencode) may narrow this further per resolved
+    /// binary; `list_engines` is the source for the composer picker.
     fn supported_permissions(&self) -> &'static [&'static str] {
         &["auto"]
     }
@@ -266,34 +268,41 @@ pub(crate) fn engine_bin(settings: &crate::settings::AppSettings, engine_id: &st
     resolve::resolve_launchable_cli_binary(cli_binary_name(engine_id))
 }
 #[tauri::command]
-pub fn list_engines() -> Vec<EngineInfo> {
+pub async fn list_engines() -> Vec<EngineInfo> {
     let settings = crate::settings::read_settings().unwrap_or_default();
     let config = crate::config::read_config().unwrap_or_default();
-    crate::config::ENGINES
-        .iter()
-        .map(|id| {
-            let engine = engine_by_id(id).expect("known engine");
-            let available = match settings.bin_override(id) {
-                Some(custom) if !custom.trim().is_empty() => {
-                    crate::settings::validate_bin_override(custom).is_ok()
-                }
-                _ if *id == "codex" && codex_bin_from_home(&settings).is_some() => true,
-                _ => resolve::find_cli_binary(cli_binary_name(id), None).is_some(),
-            };
-            EngineInfo {
-                id: id.to_string(),
-                available,
-                enabled: config.section(id).and_then(|s| s.current.as_deref())
-                    != Some(crate::config::DISABLED_PROVIDER_ID),
-                supports_images: engine.supports_images(),
-                permissions: engine
-                    .supported_permissions()
-                    .iter()
-                    .map(|m| m.to_string())
-                    .collect(),
+    let mut engines = Vec::with_capacity(crate::config::ENGINES.len());
+    for id in crate::config::ENGINES.iter().copied() {
+        let engine = engine_by_id(id).expect("known engine");
+        let available = match settings.bin_override(id) {
+            Some(custom) if !custom.trim().is_empty() => {
+                crate::settings::validate_bin_override(custom).is_ok()
             }
-        })
-        .collect()
+            _ if id == "codex" && codex_bin_from_home(&settings).is_some() => true,
+            _ => resolve::find_cli_binary(cli_binary_name(id), None).is_some(),
+        };
+        // opencode's `bypass` is version-gated: only advertise it when the
+        // resolved binary actually accepts `run --auto` (probe cached once per
+        // bin). Other engines expose a fixed set, so skip the startup cost.
+        let permissions = if id == "opencode" {
+            opencode::permissions_for(&engine_bin(&settings, id)).await
+        } else {
+            engine
+                .supported_permissions()
+                .iter()
+                .map(|m| m.to_string())
+                .collect()
+        };
+        engines.push(EngineInfo {
+            id: id.to_string(),
+            available,
+            enabled: config.section(id).and_then(|s| s.current.as_deref())
+                != Some(crate::config::DISABLED_PROVIDER_ID),
+            supports_images: engine.supports_images(),
+            permissions,
+        });
+    }
+    engines
 }
 /// Concurrent engine runs; past this the machine thrashes and the registry
 /// fan-out makes interrupts unreliable anyway.

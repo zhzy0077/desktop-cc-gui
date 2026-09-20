@@ -549,7 +549,7 @@ pub(super) async fn dispatch(app: &tauri::AppHandle, cmd: &str, raw: Value) -> R
             let a: SessionIdArgs = parse_args(&raw)?;
             ser(crate::engine::interrupt_session(app.state(), a.session_id).await)
         }
-        "list_engines" => ser(Ok(crate::engine::list_engines())),
+        "list_engines" => ser(Ok(crate::engine::list_engines().await)),
         "list_engine_models" => {
             let a: EngineArgs = parse_args(&raw)?;
             ser(

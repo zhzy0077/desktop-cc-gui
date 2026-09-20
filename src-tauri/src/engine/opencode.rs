@@ -3,6 +3,8 @@ use super::{
     EngineEvent, SendRequest,
 };
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 pub struct OpenCodeEngine;
 
@@ -18,10 +20,12 @@ impl Engine for OpenCodeEngine {
     }
 
     fn supported_permissions(&self) -> &'static [&'static str] {
-        // One-shot `run` cannot ask mid-turn ("manual" out). There is no
-        // bypass flag: opencode's default build agent already runs tools
-        // under its own config ("auto" = no flag); "plan" selects the
-        // read-only plan agent.
+        // Bin-agnostic floor. One-shot `run` cannot ask mid-turn ("manual"
+        // out); "auto" (no flag) lets the build agent run under its own
+        // config; "plan" selects the read-only plan agent. "bypass"
+        // (`run --auto`) only exists on newer builds, so it is advertised
+        // per binary by [`permissions_for`] instead of here — see that
+        // function for the version gate.
         &["auto", "plan"]
     }
 
@@ -30,9 +34,19 @@ impl Engine for OpenCodeEngine {
         cmd.arg("run");
         cmd.arg("--format");
         cmd.arg("json");
-        if self.resolve_permission(req.permission.as_deref()) == "plan" {
-            cmd.arg("--agent");
-            cmd.arg("plan");
+        // `plan` selects the read-only plan agent; `bypass` maps to
+        // `run --auto` (auto-approve everything not explicitly denied), but
+        // only on builds that advertise it — older ones exit on an unknown
+        // argument, so a selected bypass honestly degrades to auto there.
+        match req.permission.as_deref() {
+            Some("plan") => {
+                cmd.arg("--agent");
+                cmd.arg("plan");
+            }
+            Some("bypass") if auto_flag_cached(bin) => {
+                cmd.arg("--auto");
+            }
+            _ => {}
         }
         if let Some(model) = req.model.as_deref() {
             cmd.arg("--model");
@@ -272,6 +286,74 @@ fn extract_error_message(event: &Value) -> Option<String> {
     Some(message.to_string())
 }
 
+/// `run --auto` support per resolved binary, probed once per app run. Only
+/// successes are cached: a failed probe (CLI missing, help flake) must not
+/// keep hiding the mode after the user upgrades mid-session.
+static AUTO_SUPPORT: LazyLock<Mutex<HashMap<String, bool>>> =
+    LazyLock::new(Default::default);
+
+/// Modes this binary actually honors: `bypass` (`run --auto`) is offered only
+/// when the CLI advertises the flag. `list_engines` uses this for the
+/// composer picker so an unsupported mode is greyed rather than promised;
+/// older builds reject the flag, which is the whole reason for the gate.
+pub(crate) async fn permissions_for(bin: &str) -> Vec<String> {
+    let mut modes = vec!["auto".to_string(), "plan".to_string()];
+    if auto_flag_available(bin).await {
+        modes.push("bypass".to_string());
+    }
+    modes
+}
+
+/// Async capability probe: spawns `run --help` on a cache miss. Only a probe
+/// that observed `--auto` counts as support; everything else is conservative.
+async fn auto_flag_available(bin: &str) -> bool {
+    if let Some(supported) = auto_flag_cached_opt(bin) {
+        return supported;
+    }
+    if !probe_auto_flag(bin).await {
+        return false;
+    }
+    if let Ok(mut cache) = AUTO_SUPPORT.lock() {
+        cache.insert(bin.to_string(), true);
+    }
+    true
+}
+
+/// Sync guard for `build_command`: a binary whose probe has not succeeded is
+/// treated as unsupported, so a stale pick can never send an unknown flag.
+fn auto_flag_cached(bin: &str) -> bool {
+    auto_flag_cached_opt(bin).unwrap_or(false)
+}
+
+fn auto_flag_cached_opt(bin: &str) -> Option<bool> {
+    AUTO_SUPPORT.lock().ok().and_then(|cache| cache.get(bin).copied())
+}
+
+/// Reads `opencode run --help` (stdout+stderr); the short budget keeps a hung
+/// CLI from stalling engine listing, and any failure counts as unsupported.
+async fn probe_auto_flag(bin: &str) -> bool {
+    let mut cmd = command_for_binary(bin);
+    cmd.args(["run", "--help"]);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    super::hide_console(&mut cmd);
+    let Ok(Ok(output)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output()).await
+    else {
+        return false;
+    };
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    help_advertises_auto(&text)
+}
+
+fn help_advertises_auto(help: &str) -> bool {
+    help.contains("--auto")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,7 +375,11 @@ mod tests {
     }
 
     fn argv(req: &SendRequest) -> Vec<String> {
-        let built = OpenCodeEngine.build_command(req, "opencode").unwrap();
+        argv_bin(req, "opencode")
+    }
+
+    fn argv_bin(req: &SendRequest, bin: &str) -> Vec<String> {
+        let built = OpenCodeEngine.build_command(req, bin).unwrap();
         built
             .command
             .as_std()
@@ -332,10 +418,34 @@ mod tests {
             .windows(2)
             .any(|w| w == ["--model", "anthropic/claude-sonnet-5"]));
         assert!(args.windows(2).any(|w| w == ["--session", "ses_123"]));
-        // "bypass" is not a mode opencode can honor: it resolves to auto.
+    }
+
+    #[test]
+    fn bypass_maps_to_auto_only_after_a_successful_probe() {
         let mut request = req();
         request.permission = Some("bypass".to_string());
-        assert!(!argv(&request).contains(&"--agent".to_string()));
+        // Unprobed binary: `--auto` is not sent (an older CLI would exit on
+        // the unknown argument), so bypass degrades to auto, and no read-only
+        // plan agent is selected either.
+        let args = argv_bin(&request, "opencode-unprobed");
+        assert!(!args.contains(&"--auto".to_string()));
+        assert!(!args.contains(&"--agent".to_string()));
+        // A successful probe (what `list_engines` runs) unlocks the flag.
+        AUTO_SUPPORT
+            .lock()
+            .unwrap()
+            .insert("opencode-supported".to_string(), true);
+        let args = argv_bin(&request, "opencode-supported");
+        assert!(args.contains(&"--auto".to_string()));
+        assert!(!args.contains(&"--agent".to_string()));
+    }
+
+    #[test]
+    fn help_probe_requires_the_auto_flag() {
+        assert!(help_advertises_auto(
+            "FLAGS\n  --auto  Auto-approve permissions that are not explicitly denied"
+        ));
+        assert!(!help_advertises_auto("FLAGS\n  --agent string  Agent to use"));
     }
 
     #[test]
