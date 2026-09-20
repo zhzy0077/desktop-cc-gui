@@ -28,11 +28,15 @@ tokio = { version = "1", features = ["rt", "macros", "net", "process", "time", "
 sha2 = "0.10"
 dirs = "6"
 dunce = "1"
-git2 = "0.20"
-# Feature-unify openssl-sys to "vendored": git2 → libgit2-sys/libssh2-sys otherwise
-# dynamically links Homebrew's libssl/libcrypto (e.g. libssl.4.dylib), which crashes
-# the shipped .app at launch on any machine without that exact Homebrew install.
-openssl-sys = { version = "0.9", features = ["vendored"] }
+# Local repository operations (status/diff/index/commit/branches/checkout) use
+# libgit2, but with default features disabled: git2's "https" and "ssh" features
+# are the only things that pull in openssl-sys (libgit2's HTTPS backend and
+# libssh2's unix crypto backend are OpenSSL — neither supports rustls), and the
+# previous `openssl-sys = { features = ["vendored"] }` forced a from-source
+# OpenSSL build. With both features off the crate links no OpenSSL at all; the
+# network steps (fetch/push) are delegated to the system `git` binary in
+# src/git.rs, which owns TLS, credentials and SSH.
+git2 = { version = "0.20", default-features = false }
 trash = "5"
 # .gitignore-aware directory walking for the @-mention file index.
 ignore = "0.4"
@@ -54,7 +58,7 @@ futures-util = "0.3"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 serde_yaml = "0.9"
 # Linux-native Baidu Tongji transport: fixed hm.js fetch + hm.gif beacon with
-# rustls so it never touches the vendored-openssl stack or WebKit networking.
+# rustls so it never touches WebKit networking.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "multipart", "json"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -563,78 +563,66 @@ pub fn git_commit(path: String, message: String) -> Result<String, String> {
     Ok(oid.to_string())
 }
 
-/// Push/pull run over the network; credential failures should read as
-/// actionable guidance, not a libgit2 error dump.
-fn map_remote_error(e: git2::Error) -> String {
-    let message = e.message().to_string();
+/// Network remotes (fetch/push) are handled by the system `git` binary rather
+/// than libgit2: this build disables git2's `https`/`ssh` features so the app
+/// links no OpenSSL (see Cargo.toml). `git` already resolves credentials the
+/// way users expect — gitconfig credential helpers, ssh-agent, `~/.ssh` keys —
+/// and owns the TLS/SSH stack, so no credential callback is needed here.
+///
+/// Auth failures should read as actionable guidance, not a raw stderr dump.
+fn map_git_error(stderr: &str) -> String {
+    let message = stderr.trim();
     let lower = message.to_lowercase();
-    if e.code() == git2::ErrorCode::Auth
-        || lower.contains("auth")
+    if lower.contains("auth")
         || lower.contains("permission denied")
         || lower.contains("publickey")
         || lower.contains("credentials")
+        || lower.contains("could not read username")
+        || lower.contains("terminal prompts disabled")
     {
         return format!(
             "git authentication failed: check your credentials / SSH key configuration ({message})"
         );
     }
-    message
-}
-/// Credentials for network remotes, resolved the way the git CLI resolves
-/// them: gitconfig credential helpers first (HTTPS: osxkeychain / manager /
-/// store…), then ssh-agent, then libgit2's defaults (agent + ~/.ssh key
-/// paths). Without this callback libgit2 fails every auth-required remote
-/// with "remote authentication required but no callback set".
-fn remote_callbacks(config: git2::Config) -> git2::RemoteCallbacks<'static> {
-    let mut callbacks = git2::RemoteCallbacks::new();
-    callbacks.credentials(move |url, username_from_url, allowed| {
-        if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-            if let Ok(cred) = git2::Cred::credential_helper(&config, url, username_from_url) {
-                return Ok(cred);
-            }
-        }
-        if allowed.contains(git2::CredentialType::SSH_KEY) {
-            let username = username_from_url.unwrap_or("git");
-            if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
-                return Ok(cred);
-            }
-        }
-        git2::Cred::default()
-    });
-    callbacks
+    message.to_string()
 }
 
-fn push_options(config: git2::Config) -> git2::PushOptions<'static> {
-    let mut opts = git2::PushOptions::new();
-    opts.remote_callbacks(remote_callbacks(config));
-    opts
+/// Run `git -C <workdir> <args...>`, returning the trimmed stderr on failure.
+fn run_git(workdir: &str, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run git (is it installed and on PATH?): {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(map_git_error(&String::from_utf8_lossy(&output.stderr)))
 }
 
-fn fetch_options(config: git2::Config) -> git2::FetchOptions<'static> {
-    let mut opts = git2::FetchOptions::new();
-    opts.remote_callbacks(remote_callbacks(config));
-    opts
+/// Sync body of `git_push`.
+fn git_push_blocking(path: &str) -> Result<(), String> {
+    let branch = {
+        let repo = open_repo(path)?;
+        current_branch_name(&repo)?
+    };
+    // Push via the system git (libgit2 here has no HTTPS/SSH transport).
+    run_git(
+        path,
+        &[
+            "push",
+            "origin",
+            &format!("refs/heads/{branch}:refs/heads/{branch}"),
+        ],
+    )
 }
 
 #[tauri::command]
 pub async fn git_push(path: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let repo = open_repo(&path)?;
-        let branch = current_branch_name(&repo)?;
-        let mut remote = repo
-            .find_remote("origin")
-            .map_err(|e| format!("no origin remote: {e}"))?;
-        let config = repo.config().map_err(|e| e.to_string())?;
-        let mut opts = push_options(config);
-        remote
-            .push(
-                &[format!("refs/heads/{branch}:refs/heads/{branch}")],
-                Some(&mut opts),
-            )
-            .map_err(map_remote_error)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || git_push_blocking(&path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Files the fast-forward would touch that also carry local modifications —
@@ -678,16 +666,16 @@ fn ff_conflicting_files(repo: &Repository, target: git2::Oid) -> Vec<String> {
 
 /// Sync body of `git_pull` (network fetch + merge analysis).
 fn git_pull_blocking(path: &str) -> Result<(), String> {
+    let branch = {
+        let repo = open_repo(path)?;
+        current_branch_name(&repo)?
+    };
+    // Fetch via the system git (libgit2 here has no HTTPS/SSH transport), then
+    // do the merge analysis and safe fast-forward locally with libgit2. The
+    // fetch writes FETCH_HEAD, which is all the merge step needs.
+    run_git(path, &["fetch", "origin", &format!("refs/heads/{branch}")])?;
+    // Re-open after the external fetch so the refdb (and FETCH_HEAD) are fresh.
     let repo = open_repo(path)?;
-    let branch = current_branch_name(&repo)?;
-    let mut remote = repo
-        .find_remote("origin")
-        .map_err(|e| format!("no origin remote: {e}"))?;
-    let config = repo.config().map_err(|e| e.to_string())?;
-    let mut opts = fetch_options(config);
-    remote
-        .fetch(std::slice::from_ref(&branch), Some(&mut opts), None)
-        .map_err(map_remote_error)?;
     let fetch_head = repo
         .find_reference("FETCH_HEAD")
         .map_err(|e| e.to_string())?;
@@ -1133,5 +1121,33 @@ mod tests {
         let status = git_status_blocking(repo_path.to_str().unwrap()).unwrap();
         assert_eq!(status.ahead, None, "status={status:?}");
         assert_eq!(status.behind, None, "status={status:?}");
+    }
+
+    #[test]
+    fn push_updates_the_origin_branch() {
+        // `git_push` delegates to the system git, so this exercises the real
+        // path against a local bare remote.
+        let scratch = Scratch::new();
+        let origin_path = scratch.0.join("origin.git");
+        Repository::init_bare(&origin_path).unwrap();
+        let local_path = scratch.0.join("local");
+        let local = Repository::init(&local_path).unwrap();
+        local
+            .remote("origin", origin_path.to_str().unwrap())
+            .unwrap();
+        commit_file(&local, "a.txt", "a\n");
+        let branch = local.head().unwrap().shorthand().unwrap().to_string();
+        let head = local.head().unwrap().target().unwrap();
+
+        git_push_blocking(local_path.to_str().unwrap()).unwrap();
+
+        // Re-open: the ref was written by the external git process.
+        let origin = Repository::open_bare(&origin_path).unwrap();
+        let pushed = origin
+            .find_reference(&format!("refs/heads/{branch}"))
+            .unwrap()
+            .target()
+            .unwrap();
+        assert_eq!(pushed, head);
     }
 }

@@ -130,7 +130,8 @@ jobs:
             --issuer "$APPLE_API_ISSUER_ID" \
             --key "private_keys/AuthKey.p8"
 
-      # Single-binary app (openssl vendored, no daemon subcomponent), so Tauri
+      # Single-binary app (no OpenSSL dependency; git network ops delegate to
+      # the system `git` CLI, no daemon subcomponent), so Tauri
       # can codesign mid-bundle — unlike the 0.9.x flow that re-signed after.
       # With TAURI_SIGNING_PRIVATE_KEY set, `createUpdaterArtifacts` also emits
       # "CC GUI.app.tar.gz" + .sig for the updater channel.
